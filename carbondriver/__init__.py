@@ -87,6 +87,7 @@ class GDEOptimizer:
         self.df = pd.DataFrame()
 
         self.llm_history = []  # list of {"step": i, "suggestion": ..., "reason": ...}
+        self.last_prediction_means = None
 
         self._bounds = bounds
 
@@ -347,6 +348,7 @@ class GDEOptimizer:
                 f"  {label}: [{raw_bounds[0, i].item():.4g}, {raw_bounds[1, i].item():.4g}]"
                 for i, label in enumerate(self.input_labels)
             )
+            prediction_example = {label: 0.0 for label in self.output_labels}
             return (
                 f"{history_str}"
                 f"{data_str}"
@@ -355,8 +357,9 @@ class GDEOptimizer:
                 f"in the fewest number of experiments.\n"
                 f"Respond with ONLY a JSON object with:\n"
                 f'  parameter names mapped to their suggested values\n'
+                f'  "predicted_objectives": estimated values for every objective\n'
                 f'  "reason": brief explanation\n'
-                f'Example: {json.dumps({**{l: 0.0 for l in self.input_labels}, "reason": "..."})}'
+                f'Example: {json.dumps({**{l: 0.0 for l in self.input_labels}, "predicted_objectives": prediction_example, "reason": "..."})}'
             )
         else:  # step_within_data
             return (
@@ -372,13 +375,59 @@ class GDEOptimizer:
             )
 
     def _read_response(self, text: str) -> dict:
-        """Strip markdown code fences from LLM output and parse as JSON."""
-        text = text.strip()
-        if text.startswith("```"):
-            text = text.split("```")[1]
-            if text.startswith("json"):
-                text = text[4:]
-        return json.loads(text.strip())
+        """Parse a JSON object even when the provider adds fences or brief prose."""
+        if not isinstance(text, str) or not text.strip():
+            raise ValueError("The LLM returned an empty response.")
+
+        cleaned = text.strip()
+        if cleaned.startswith("```"):
+            lines = cleaned.splitlines()
+            if lines and lines[0].strip().lower() in {"```", "```json"}:
+                lines = lines[1:]
+            if lines and lines[-1].strip() == "```":
+                lines = lines[:-1]
+            cleaned = "\n".join(lines).strip()
+
+        try:
+            result = json.loads(cleaned)
+        except json.JSONDecodeError as original_error:
+            decoder = json.JSONDecoder()
+            result = None
+            for position, character in enumerate(cleaned):
+                if character != "{":
+                    continue
+                try:
+                    result, _ = decoder.raw_decode(cleaned[position:])
+                    break
+                except json.JSONDecodeError:
+                    continue
+            if result is None:
+                preview = cleaned[:200].replace("\n", " ")
+                raise ValueError(
+                    f"The LLM response was not valid JSON. Response began with: {preview!r}"
+                ) from original_error
+
+        if not isinstance(result, dict):
+            raise ValueError(
+                f"The LLM must return a JSON object, but returned {type(result).__name__}."
+            )
+        return result
+
+    @staticmethod
+    def _gemini_empty_response_details(response) -> str:
+        """Summarize Gemini metadata without exposing request credentials."""
+        details = []
+        prompt_feedback = getattr(response, "prompt_feedback", None)
+        if prompt_feedback is not None:
+            block_reason = getattr(prompt_feedback, "block_reason", None)
+            if block_reason:
+                details.append(f"prompt block reason: {block_reason}")
+
+        for candidate in getattr(response, "candidates", None) or []:
+            finish_reason = getattr(candidate, "finish_reason", None)
+            if finish_reason:
+                details.append(f"finish reason: {finish_reason}")
+        return "; ".join(dict.fromkeys(details))
 
     def _llm_suggest(
         self,
@@ -402,21 +451,29 @@ class GDEOptimizer:
 
         if api == "gemini":
             from google import genai
+            from google.genai import types
+
             client = genai.Client(api_key=api_key)
-            attempt = 0
-            for attempt in range(self.config.get("llm_max_attempts", 3)):
-                try:
-                    response = client.models.generate_content(
-                        model=self.config["llm_model"],
-                        contents=[system, user])
-                    break
-                except Exception as e:
-                    if attempt + 1 == self.config.get("llm_max_attempts", 3):
-                        raise
-                    else:
-                        print(f"LLM API call failed (attempt {attempt+1}/{self.config.get('llm_max_attempts', 3)}): {e}")
-                    
-            text = response.text
+            response = client.models.generate_content(
+                model=self.config["llm_model"],
+                contents=user,
+                config=types.GenerateContentConfig(
+                    system_instruction=system,
+                    response_mime_type="application/json",
+                    temperature=0.2,
+                ),
+            )
+            try:
+                text = response.text
+            except (AttributeError, ValueError):
+                text = None
+            if not text or not text.strip():
+                details = self._gemini_empty_response_details(response)
+                suffix = f" ({details})" if details else ""
+                raise ValueError(
+                    "Gemini returned no response text"
+                    f"{suffix}. Check the selected model, safety feedback, quota, and prompt size."
+                )
 
         elif api == "openai":
             from openai import OpenAI
@@ -430,14 +487,38 @@ class GDEOptimizer:
             text = response.choices[0].message.content
 
         elif api == "claude":
-            from anthropic import Anthropic
-            response = Anthropic(api_key=api_key).messages.create(
+            import anthropic
+
+            response = anthropic.Anthropic(api_key=api_key).messages.create(
                 model=self.config["llm_model"],
                 max_tokens=1024,
                 system=system,
                 messages=[{"role": "user", "content": user}],
             )
-            text = response.content[0].text
+            text_parts = []
+            structured_result = None
+            for block in response.content:
+                block_type = getattr(block, "type", None)
+                if block_type == "text":
+                    block_text = getattr(block, "text", None)
+                    if block_text:
+                        text_parts.append(block_text)
+                elif block_type == "tool_use":
+                    block_input = getattr(block, "input", None)
+                    if isinstance(block_input, dict):
+                        structured_result = block_input
+
+            if structured_result is not None:
+                return structured_result
+
+            text = "\n".join(text_parts).strip()
+            if not text:
+                stop_reason = getattr(response, "stop_reason", None)
+                suffix = f" (stop reason: {stop_reason})" if stop_reason else ""
+                raise ValueError(
+                    "Claude returned no text or structured JSON"
+                    f"{suffix}. Check the selected model, safety response, quota, and prompt size."
+                )
 
         else:
             raise ValueError(f"Unsupported llm_api '{api}'. Choose 'gemini', 'openai', or 'claude'.")
@@ -459,7 +540,16 @@ class GDEOptimizer:
         if self.model == "LLM":
             result = self._llm_suggest("step", bounds=bounds)
             reason = result.pop("reason", None)
+            predicted_objectives = result.pop("predicted_objectives", None)
             suggestion = {l: result[l] for l in self.input_labels}
+            if isinstance(predicted_objectives, dict):
+                self.last_prediction_means = {
+                    label: float(predicted_objectives[label])
+                    for label in self.output_labels
+                    if label in predicted_objectives
+                }
+            else:
+                self.last_prediction_means = None
             self.llm_history.append({"step": self.i, "suggestion": suggestion, "reason": reason})
             if reason:
                 print(f"LLM reason: {reason}")
